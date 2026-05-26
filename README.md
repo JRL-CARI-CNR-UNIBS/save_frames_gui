@@ -1,4 +1,4 @@
-# save_frames_gui
+<# save_frames_gui
 
 ROS 2 Python package for real-time RGB/depth preview and manual frame capture from multiple cameras in parallel.
 
@@ -20,22 +20,18 @@ ROS 2 Python package for real-time RGB/depth preview and manual frame capture fr
 
 Example for ROS 2 Humble/Iron/Jazzy on Ubuntu:
 
-```bash
-sudo apt update
-sudo apt install \
-  ros-$ROS_DISTRO-cv-bridge \
-  ros-$ROS_DISTRO-message-filters \
-  python3-pyqt5 \
-  python3-opencv \
-  python3-numpy \
-  python3-yaml
-```
 
 ## Installation
 
 ```bash
+sudo apt update
+sudo apt install -y   python3-pyqt5   libxcb-xinerama0   libxcb-cursor0   libxkbcommon-x11-0   libxcb-icccm4   libxcb-image0   libxcb-keysyms1   libxcb-render-util0   libxcb-xinput0   x11-apps
+```
+
+
+```bash
 cd ~/ros2_ws/src
-unzip /path/to/save_frames_gui.zip
+git clone https://github.com/JRL-CARI-CNR-UNIBS/save_frames_gui.git
 cd ~/ros2_ws
 rosdep install --from-paths src --ignore-src -r -y
 colcon build --symlink-install
