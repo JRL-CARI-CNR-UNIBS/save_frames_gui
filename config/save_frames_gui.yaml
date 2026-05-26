@@ -1,0 +1,36 @@
+# This YAML is intentionally read by the node as a normal YAML file.
+# The launch file passes only its path as the ROS parameter `config_file`.
+# This keeps the camera blocks below exactly in the requested top-level style.
+# This will be changed in the future when the yaml will be treated as a ROS parameter file.
+
+save_frames_gui_node:
+  ros__parameters:
+    cameras: [rs1, rs2, rs3]
+    dataset_dir: "/tmp/vision_system_dataset"
+    ui_refresh_rate_hz: 30.0
+    sync_queue_size: 10
+    sync_slop_sec: 0.05
+
+rs1:
+  color_image_topic: "/rs1/rs1/color/image_raw"
+  depth_image_topic: "/rs1/rs1/aligned_depth_to_color/image_raw"
+  camera_info_topic: "/rs1/rs1/aligned_depth_to_color/camera_info"
+  frames_approx_sync: false
+  depth_frame_encoding: "32FC1"
+  depth_unit_in_meters: true
+
+rs2:
+  color_image_topic: "/rs2/rs2/color/image_raw"
+  depth_image_topic: "/rs2/rs2/aligned_depth_to_color/image_raw"
+  camera_info_topic: "/rs2/rs2/aligned_depth_to_color/camera_info"
+  frames_approx_sync: false
+  depth_frame_encoding: "32FC1"
+  depth_unit_in_meters: true
+
+rs3:
+  color_image_topic: "/rs3/rs3/color/image_raw"
+  depth_image_topic: "/rs3/rs3/aligned_depth_to_color/image_raw"
+  camera_info_topic: "/rs3/rs3/aligned_depth_to_color/camera_info"
+  frames_approx_sync: false
+  depth_frame_encoding: "32FC1"
+  depth_unit_in_meters: true
