@@ -1,7 +1,6 @@
 # This YAML is intentionally read by the node as a normal YAML file.
 # The launch file passes only its path as the ROS parameter `config_file`.
 # This keeps the camera blocks below exactly in the requested top-level style.
-# This will be changed in the future when the yaml will be treated as a ROS parameter file.
 
 save_frames_gui_node:
   ros__parameters:
@@ -10,6 +9,7 @@ save_frames_gui_node:
     ui_refresh_rate_hz: 30.0
     sync_queue_size: 10
     sync_slop_sec: 0.05
+    save_all_service_name: "~/save_all_frames"
 
 rs1:
   color_image_topic: "/rs1/rs1/color/image_raw"

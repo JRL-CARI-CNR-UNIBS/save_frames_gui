@@ -27,8 +27,9 @@ from cv_bridge import CvBridge
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from sensor_msgs.msg import CameraInfo, Image
+from std_srvs.srv import Trigger
 
-from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtCore import QLibraryInfo, Qt, QTimer
 from PyQt5.QtGui import QFont, QImage, QPixmap
 from PyQt5.QtWidgets import (
     QApplication,
@@ -73,6 +74,14 @@ class FrameSnapshot:
     camera_info: Optional[dict]
     color_encoding: str
     depth_encoding: str
+
+
+@dataclass
+class SaveOptions:
+    dataset_dir: str
+    rgb_format: str = "png"
+    depth_format: str = "npy"
+    save_mode: str = "RGB + depth_m"
 
 
 @dataclass
@@ -250,6 +259,16 @@ class SaveFramesGuiNode(Node):
         self.ui_refresh_rate_hz = float(node_params.get("ui_refresh_rate_hz", 30.0))
         self.sync_queue_size = int(node_params.get("sync_queue_size", 10))
         self.sync_slop_sec = float(node_params.get("sync_slop_sec", 0.05))
+        self.save_all_service_name = str(node_params.get("save_all_service_name", "~/save_all_frames"))
+
+        self.save_options_lock = threading.Lock()
+        self.save_lock = threading.Lock()
+        self.save_options = SaveOptions(
+            dataset_dir=self.dataset_dir,
+            rgb_format="png",
+            depth_format="npy",
+            save_mode="RGB + depth_m",
+        )
 
         camera_names = list(node_params.get("cameras", []))
         if not camera_names:
@@ -273,6 +292,187 @@ class SaveFramesGuiNode(Node):
 
         if not self.streams:
             self.get_logger().warning("No cameras configured. Check config_file and cameras list.")
+
+        self.save_all_service = self.create_service(
+            Trigger, self.save_all_service_name, self._save_all_frames_service_callback
+        )
+        self.get_logger().info(f"Save-all Trigger service ready: {self.save_all_service_name}")
+
+    def update_save_options(
+        self,
+        dataset_dir: Optional[str] = None,
+        rgb_format: Optional[str] = None,
+        depth_format: Optional[str] = None,
+        save_mode: Optional[str] = None,
+    ) -> None:
+        with self.save_options_lock:
+            current = self.save_options
+            self.save_options = SaveOptions(
+                dataset_dir=str(dataset_dir if dataset_dir is not None else current.dataset_dir),
+                rgb_format=str(rgb_format if rgb_format is not None else current.rgb_format),
+                depth_format=str(depth_format if depth_format is not None else current.depth_format),
+                save_mode=str(save_mode if save_mode is not None else current.save_mode),
+            )
+
+    def get_save_options(self) -> SaveOptions:
+        with self.save_options_lock:
+            return SaveOptions(
+                dataset_dir=self.save_options.dataset_dir,
+                rgb_format=self.save_options.rgb_format,
+                depth_format=self.save_options.depth_format,
+                save_mode=self.save_options.save_mode,
+            )
+
+    def _save_all_frames_service_callback(self, request, response):  # noqa: ANN001
+        del request
+        try:
+            results = self.save_all_available()
+            saved_results, warnings, saved_names, skipped_names, message = self.format_save_results(results)
+            response.success = bool(saved_results)
+            response.message = message
+            if warnings:
+                self.get_logger().warning(message.replace("\n", " | "))
+            else:
+                self.get_logger().info(message)
+        except Exception as exc:  # noqa: BLE001
+            response.success = False
+            response.message = f"Save-all service failed: {exc}"
+            self.get_logger().error(response.message)
+        return response
+
+    def save_all_available(self, options: Optional[SaveOptions] = None) -> list:
+        options = options or self.get_save_options()
+        results = []
+        with self.save_lock:
+            for camera_name in self.streams:
+                try:
+                    results.append(self._save_camera_unlocked(camera_name, options, best_effort=True))
+                except Exception as exc:  # noqa: BLE001
+                    results.append(SaveResult(camera_name=camera_name, saved_files=[], warnings=[str(exc)]))
+        return results
+
+    @staticmethod
+    def format_save_results(results: list) -> tuple:
+        saved_results = [r for r in results if r.saved]
+        warnings = []
+        for result in results:
+            warnings.extend(result.warnings)
+
+        saved_names = ", ".join(r.camera_name for r in saved_results) or "none"
+        skipped_names = ", ".join(r.camera_name for r in results if not r.saved) or "none"
+
+        if warnings:
+            message = (
+                "Partial save completed. "
+                f"Saved cameras: {saved_names}. "
+                f"Skipped cameras: {skipped_names}. "
+                "Details: " + " | ".join(warnings)
+            )
+        else:
+            message = f"Saved frames for {len(saved_results)} cameras: {saved_names}"
+        return saved_results, warnings, saved_names, skipped_names, message
+
+    def save_camera(
+        self, camera_name: str, options: Optional[SaveOptions] = None, best_effort: bool = False
+    ) -> SaveResult:
+        options = options or self.get_save_options()
+        with self.save_lock:
+            return self._save_camera_unlocked(camera_name, options, best_effort=best_effort)
+
+    def _save_camera_unlocked(self, camera_name: str, options: SaveOptions, best_effort: bool = False) -> SaveResult:
+        stream = self.streams[camera_name]
+        cfg = self.camera_configs[camera_name]
+        snapshot = stream.snapshot()
+        mode = options.save_mode
+        need_rgb = mode in ("RGB only", "RGB + depth_m")
+        need_depth = mode in ("RGB + depth_m", "Depth only")
+        warnings = []
+
+        rgb_available = snapshot.color_bgr is not None
+        depth_available = snapshot.depth_m is not None
+
+        if need_rgb and not rgb_available:
+            message = f"{camera_name}: RGB frame is not available yet."
+            if best_effort:
+                warnings.append(message)
+            else:
+                raise RuntimeError(message)
+
+        if need_depth and not depth_available:
+            message = f"{camera_name}: depth frame is not available yet."
+            if best_effort:
+                warnings.append(message)
+            else:
+                raise RuntimeError(message)
+
+        save_rgb = need_rgb and rgb_available
+        save_depth_frame = need_depth and depth_available
+
+        if not save_rgb and not save_depth_frame:
+            if best_effort:
+                if not warnings:
+                    warnings.append(f"{camera_name}: no requested frame data is available.")
+                return SaveResult(camera_name=camera_name, saved_files=[], warnings=warnings)
+            raise RuntimeError(f"{camera_name}: no requested frame data is available.")
+
+        dataset_dir = Path(options.dataset_dir).expanduser()
+        camera_dir = dataset_dir / camera_name
+        color_dir = camera_dir / "color"
+        depth_dir = camera_dir / "depth"
+        meta_dir = camera_dir / "meta"
+        color_dir.mkdir(parents=True, exist_ok=True)
+        depth_dir.mkdir(parents=True, exist_ok=True)
+        meta_dir.mkdir(parents=True, exist_ok=True)
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        file_stem = f"{camera_name}_{timestamp}"
+        saved_files = []
+
+        if save_rgb:
+            rgb_ext = options.rgb_format
+            rgb_path = color_dir / f"{file_stem}_rgb.{rgb_ext}"
+            if not cv2.imwrite(str(rgb_path), snapshot.color_bgr):
+                raise RuntimeError(f"Unable to write RGB image: {rgb_path}")
+            saved_files.append(str(rgb_path.relative_to(camera_dir)))
+
+        if save_depth_frame:
+            depth_path = save_depth(snapshot.depth_m, depth_dir, file_stem, options.depth_format)
+            saved_files.append(str(depth_path.relative_to(camera_dir)))
+
+        meta_path = meta_dir / f"{file_stem}_meta.json"
+        meta_rel = str(meta_path.relative_to(camera_dir))
+
+        meta = {
+            "camera": camera_name,
+            "dataset_layout": "per_camera_color_depth_meta_v1",
+            "saved_at_local": datetime.now().isoformat(timespec="milliseconds"),
+            "requested_mode": mode,
+            "actual_saved": {
+                "rgb": bool(save_rgb),
+                "depth": bool(save_depth_frame),
+            },
+            "warnings": warnings,
+            "rgb_format": options.rgb_format,
+            "depth_format": options.depth_format,
+            "color_stamp": snapshot.color_stamp,
+            "depth_stamp": snapshot.depth_stamp,
+            "color_frame_id": snapshot.color_frame_id,
+            "depth_frame_id": snapshot.depth_frame_id,
+            "color_encoding": snapshot.color_encoding,
+            "depth_encoding": snapshot.depth_encoding or cfg.depth_frame_encoding,
+            "depth_unit_saved": "meters_float32_for_npy_tiff32_exr; millimeters_uint16_for_png16",
+            "topics": {
+                "color_image_topic": cfg.color_image_topic,
+                "depth_image_topic": cfg.depth_image_topic,
+                "camera_info_topic": cfg.camera_info_topic,
+            },
+            "camera_info": snapshot.camera_info,
+            "files": saved_files + [meta_rel],
+        }
+        with meta_path.open("w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2)
+        saved_files.append(meta_rel)
+        return SaveResult(camera_name=camera_name, saved_files=saved_files, warnings=warnings)
 
     def _load_yaml(self, path: str) -> dict:
         if not path:
@@ -398,6 +598,11 @@ class MainWindow(QMainWindow):
         self.save_mode_combo.addItems(["RGB only", "RGB + depth_m", "Depth only"])
         self.save_mode_combo.setCurrentText("RGB + depth_m")
 
+        self.dataset_edit.textChanged.connect(self._sync_save_options)
+        self.rgb_format_combo.currentTextChanged.connect(self._sync_save_options)
+        self.depth_format_combo.currentTextChanged.connect(self._sync_save_options)
+        self.save_mode_combo.currentTextChanged.connect(self._sync_save_options)
+
         save_btn = QPushButton("Save active camera frame")
         save_btn.setObjectName("PrimaryButton")
         save_btn.clicked.connect(self._save_active_camera)
@@ -436,6 +641,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(root)
         self.setStatusBar(QStatusBar())
         self.statusBar().showMessage("Ready")
+        self._sync_save_options()
 
     def _apply_style(self) -> None:
         app_font = QFont("Inter", 10)
@@ -536,6 +742,14 @@ class MainWindow(QMainWindow):
         if directory:
             self.dataset_edit.setText(directory)
 
+    def _sync_save_options(self, *_args) -> None:
+        self.node.update_save_options(
+            dataset_dir=self.dataset_edit.text(),
+            rgb_format=self.rgb_format_combo.currentText(),
+            depth_format=self.depth_format_combo.currentText(),
+            save_mode=self.save_mode_combo.currentText(),
+        )
+
     def _refresh_previews(self) -> None:
         for camera_name, stream in self.node.streams.items():
             tab = self.camera_tabs.get(camera_name)
@@ -559,7 +773,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Save failed", "No active camera.")
             return
         try:
-            result = self._save_camera(camera_name, best_effort=False)
+            result = self.node.save_camera(camera_name, best_effort=False)
             self.statusBar().showMessage(f"Saved {camera_name}: {', '.join(result.saved_files)}")
             if result.warnings:
                 QMessageBox.warning(self, "Saved with warnings", "\n".join(result.warnings))
@@ -567,36 +781,18 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Save failed", str(exc))
 
     def _save_all_cameras(self) -> None:
-        """Save a best-effort snapshot for every configured camera.
-
-        The all-camera action must not fail as a whole just because one camera
-        has not produced a frame yet. For each camera, only the requested and
-        currently available modalities are written. Cameras with no usable data
-        are skipped and reported to the user.
-        """
-        results = []
-        for camera_name in self.node.streams:
-            try:
-                results.append(self._save_camera(camera_name, best_effort=True))
-            except Exception as exc:  # noqa: BLE001
-                results.append(SaveResult(camera_name=camera_name, saved_files=[], warnings=[str(exc)]))
-
-        saved_results = [r for r in results if r.saved]
-        warnings = []
-        for result in results:
-            warnings.extend(result.warnings)
-
-        saved_names = ", ".join(r.camera_name for r in saved_results) or "none"
-        skipped_names = ", ".join(r.camera_name for r in results if not r.saved) or "none"
+        """Save a best-effort snapshot for every configured camera."""
+        results = self.node.save_all_available()
+        saved_results, warnings, saved_names, skipped_names, message = self.node.format_save_results(results)
 
         if warnings:
-            QMessageBox.warning(
-                self,
-                "Partial save completed",
-                "Saved cameras: " + saved_names + "\n"
-                "Skipped cameras: " + skipped_names + "\n\n"
-                "Details:\n" + "\n".join(warnings),
-            )
+            detail_lines = []
+            detail_lines.append("Saved cameras: " + saved_names)
+            detail_lines.append("Skipped cameras: " + skipped_names)
+            detail_lines.append("")
+            detail_lines.append("Details:")
+            detail_lines.extend(warnings)
+            QMessageBox.warning(self, "Partial save completed", "\n".join(detail_lines))
         else:
             QMessageBox.information(
                 self,
@@ -608,118 +804,33 @@ class MainWindow(QMainWindow):
         )
 
     def _save_camera(self, camera_name: str, best_effort: bool = False) -> SaveResult:
-        stream = self.node.streams[camera_name]
-        cfg = self.node.camera_configs[camera_name]
-        snapshot = stream.snapshot()
-        mode = self.save_mode_combo.currentText()
-        need_rgb = mode in ("RGB only", "RGB + depth_m")
-        need_depth = mode in ("RGB + depth_m", "Depth only")
-        warnings = []
-
-        rgb_available = snapshot.color_bgr is not None
-        depth_available = snapshot.depth_m is not None
-
-        if need_rgb and not rgb_available:
-            message = f"{camera_name}: RGB frame is not available yet."
-            if best_effort:
-                warnings.append(message)
-            else:
-                raise RuntimeError(message)
-
-        if need_depth and not depth_available:
-            message = f"{camera_name}: depth frame is not available yet."
-            if best_effort:
-                warnings.append(message)
-            else:
-                raise RuntimeError(message)
-
-        save_rgb = need_rgb and rgb_available
-        save_depth_frame = need_depth and depth_available
-
-        if not save_rgb and not save_depth_frame:
-            if best_effort:
-                if not warnings:
-                    warnings.append(f"{camera_name}: no requested frame data is available.")
-                return SaveResult(camera_name=camera_name, saved_files=[], warnings=warnings)
-            raise RuntimeError(f"{camera_name}: no requested frame data is available.")
-
-        dataset_dir = Path(self.dataset_edit.text()).expanduser()
-        camera_dir = dataset_dir / camera_name
-        camera_dir.mkdir(parents=True, exist_ok=True)
-
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-        base = camera_dir / f"{camera_name}_{timestamp}"
-        saved_files = []
-
-        if save_rgb:
-            rgb_ext = self.rgb_format_combo.currentText()
-            rgb_path = base.with_name(base.name + f"_rgb.{rgb_ext}")
-            if not cv2.imwrite(str(rgb_path), snapshot.color_bgr):
-                raise RuntimeError(f"Unable to write RGB image: {rgb_path}")
-            saved_files.append(rgb_path.name)
-
-        if save_depth_frame:
-            depth_format = self.depth_format_combo.currentText()
-            depth_path = save_depth(snapshot.depth_m, base, depth_format)
-            saved_files.append(depth_path.name)
-
-        meta = {
-            "camera": camera_name,
-            "saved_at_local": datetime.now().isoformat(timespec="milliseconds"),
-            "requested_mode": mode,
-            "actual_saved": {
-                "rgb": bool(save_rgb),
-                "depth": bool(save_depth_frame),
-            },
-            "warnings": warnings,
-            "rgb_format": self.rgb_format_combo.currentText(),
-            "depth_format": self.depth_format_combo.currentText(),
-            "color_stamp": snapshot.color_stamp,
-            "depth_stamp": snapshot.depth_stamp,
-            "color_frame_id": snapshot.color_frame_id,
-            "depth_frame_id": snapshot.depth_frame_id,
-            "color_encoding": snapshot.color_encoding,
-            "depth_encoding": snapshot.depth_encoding or cfg.depth_frame_encoding,
-            "depth_unit_saved": "meters_float32_for_npy_tiff32_exr; millimeters_uint16_for_png16",
-            "topics": {
-                "color_image_topic": cfg.color_image_topic,
-                "depth_image_topic": cfg.depth_image_topic,
-                "camera_info_topic": cfg.camera_info_topic,
-            },
-            "camera_info": snapshot.camera_info,
-            "files": saved_files,
-        }
-        meta_path = base.with_name(base.name + "_meta.json")
-        with meta_path.open("w", encoding="utf-8") as f:
-            json.dump(meta, f, indent=2)
-        saved_files.append(meta_path.name)
-        return SaveResult(camera_name=camera_name, saved_files=saved_files, warnings=warnings)
+        return self.node.save_camera(camera_name, best_effort=best_effort)
 
 
-def save_depth(depth_m: np.ndarray, base: Path, depth_format: str) -> Path:
+def save_depth(depth_m: np.ndarray, depth_dir: Path, file_stem: str, depth_format: str) -> Path:
     depth_m = np.asarray(depth_m, dtype=np.float32)
     clean_depth = np.nan_to_num(depth_m, nan=0.0, posinf=0.0, neginf=0.0)
 
     if depth_format == "npy":
-        path = base.with_name(base.name + "_depth_m.npy")
+        path = depth_dir / f"{file_stem}_depth_m.npy"
         np.save(str(path), clean_depth.astype(np.float32))
         return path
 
     if depth_format == "png16":
-        path = base.with_name(base.name + "_depth_mm.png")
+        path = depth_dir / f"{file_stem}_depth_mm.png"
         depth_mm = np.clip(clean_depth * 1000.0, 0, np.iinfo(np.uint16).max).astype(np.uint16)
         if not cv2.imwrite(str(path), depth_mm):
             raise RuntimeError(f"Unable to write depth PNG16: {path}")
         return path
 
     if depth_format == "tiff32":
-        path = base.with_name(base.name + "_depth_m.tiff")
+        path = depth_dir / f"{file_stem}_depth_m.tiff"
         if not cv2.imwrite(str(path), clean_depth.astype(np.float32)):
             raise RuntimeError(f"Unable to write depth TIFF32: {path}")
         return path
 
     if depth_format == "exr":
-        path = base.with_name(base.name + "_depth_m.exr")
+        path = depth_dir / f"{file_stem}_depth_m.exr"
         if not cv2.imwrite(str(path), clean_depth.astype(np.float32)):
             raise RuntimeError(
                 f"Unable to write depth EXR: {path}. "
@@ -736,6 +847,24 @@ def cv_bgr_to_qpixmap(image_bgr: np.ndarray, target_size) -> QPixmap:
     bytes_per_line = ch * w
     qimg = QImage(rgb.data, w, h, bytes_per_line, QImage.Format_RGB888).copy()
     return QPixmap.fromImage(qimg).scaled(target_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
+
+def prefer_pyqt_platform_plugins() -> None:
+    """Prefer PyQt platform plugins over OpenCV wheel Qt plugins.
+
+    The non-headless `opencv-python` wheel may set Qt plugin paths to
+    `cv2/qt/plugins`, which can break PyQt applications with the classic
+    `Could not load the Qt platform plugin "xcb"` error. Resetting the
+    platform plugin path before QApplication is created makes the GUI more
+    robust.
+    """
+    try:
+        plugins_path = Path(QLibraryInfo.location(QLibraryInfo.PluginsPath)) / "platforms"
+        if plugins_path.exists():
+            os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = str(plugins_path)
+        os.environ.pop("QT_PLUGIN_PATH", None)
+    except Exception:
+        pass
 
 
 def depth_m_to_qpixmap(depth_m: np.ndarray, target_size) -> QPixmap:
@@ -762,6 +891,7 @@ def main(args=None) -> None:
     rclpy.init(args=args)
     node = SaveFramesGuiNode()
 
+    prefer_pyqt_platform_plugins()
     app = QApplication(sys.argv)
     app.setApplicationName("ROS 2 RGB-D Dataset Saver")
     window = MainWindow(node)

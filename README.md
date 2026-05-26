@@ -86,20 +86,29 @@ rs1:
 
 ## Saved dataset structure
 
+Each camera gets its own directory. RGB, depth, and metadata are separated into `color/`, `depth/`, and `meta/` subdirectories.
+
 Example:
 
 ```text
 /tmp/vision_system_dataset/
   rs1/
-    rs1_20260525_153012_421_rgb.png
-    rs1_20260525_153012_421_depth_m.npy
-    rs1_20260525_153012_421_meta.json
+    color/
+      rs1_20260525_153012_421_rgb.png
+    depth/
+      rs1_20260525_153012_421_depth_m.npy
+    meta/
+      rs1_20260525_153012_421_meta.json
   rs2/
-    rs2_20260525_153012_427_rgb.png
-    rs2_20260525_153012_427_depth_m.npy
-    rs2_20260525_153012_427_meta.json
+    color/
+      rs2_20260525_153012_427_rgb.png
+    depth/
+      rs2_20260525_153012_427_depth_m.npy
+    meta/
+      rs2_20260525_153012_427_meta.json
 ```
 
+The timestamp in the filename is the local save time with millisecond precision: `YYYYMMDD_HHMMSS_mmm`. Exact ROS message timestamps are stored in the metadata.
 
 ## Metadata timestamp format
 
@@ -141,8 +150,40 @@ The active-camera save button remains strict: if the selected mode requires RGB/
 - `tiff32`: saves `float32` in meters.
 - `exr`: saves `float32` in meters, but requires OpenCV built with OpenEXR enabled.
 
+
+## Qt/OpenCV note
+
+For pip-based environments, prefer `opencv-python-headless` instead of `opencv-python`. The GUI uses PyQt for display, and OpenCV is only used for image conversion/saving. This avoids OpenCV's bundled Qt plugin path from overriding PyQt's platform plugin. The node also resets the Qt platform plugin path before creating `QApplication` as a defensive measure.
+
 ## Use with vision_system
 
 This package does not require `vision_system`: it directly consumes standard ROS 2 `sensor_msgs/Image` and `sensor_msgs/CameraInfo` topics.
 
 `vision_system` can still be used upstream for camera acquisition or camera management. This GUI can subscribe to the topics published/configured by that pipeline. The dependency is kept optional so the tool remains generic and compatible with RealSense, simulators, rosbag playback, and other ROS 2 drivers.
+
+
+## Trigger service
+
+The node exposes a `std_srvs/srv/Trigger` service that performs the same action as the **Save all available frames** button.
+
+Default service name:
+
+```bash
+/save_frames_gui_node/save_all_frames
+```
+
+Call it with:
+
+```bash
+ros2 service call /save_frames_gui_node/save_all_frames std_srvs/srv/Trigger {}
+```
+
+The service uses the current save settings mirrored from the GUI: dataset directory, RGB format, depth format, and save mode. Its behavior is best-effort: it saves all cameras/modalities currently available and reports skipped cameras or missing frames in the response message.
+
+You can change the service name in `config/save_frames_gui.yaml`:
+
+```yaml
+save_frames_gui_node:
+  ros__parameters:
+    save_all_service_name: "~/save_all_frames"
+```
