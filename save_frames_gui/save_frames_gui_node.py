@@ -26,7 +26,7 @@ import yaml
 from cv_bridge import CvBridge
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
-from sensor_msgs.msg import CameraInfo, Image
+from sensor_msgs.msg import CameraInfo, Image, CompressedImage
 from std_srvs.srv import Trigger
 
 from PyQt5.QtCore import QLibraryInfo, Qt, QTimer
@@ -58,10 +58,11 @@ class CameraConfig:
     color_image_topic: str
     depth_image_topic: str = ""
     camera_info_topic: str = ""
+    color_compressed: bool = False
+    depth_compressed: bool = False
     frames_approx_sync: bool = True
     depth_frame_encoding: str = "32FC1"
     depth_unit_in_meters: bool = True
-
 
 @dataclass
 class FrameSnapshot:
@@ -74,7 +75,8 @@ class FrameSnapshot:
     camera_info: Optional[dict]
     color_encoding: str
     depth_encoding: str
-
+    color_compressed_format: str
+    depth_compressed_format: str
 
 @dataclass
 class SaveOptions:
@@ -113,6 +115,8 @@ class CameraStream:
         self.depth_frame_id: str = ""
         self.color_encoding: str = ""
         self.depth_encoding: str = ""
+        self.color_compressed_format: str = ""
+        self.depth_compressed_format: str = ""
         self.camera_info: Optional[dict] = None
         self.last_error: str = "Waiting for frames"
         self.frames_received = 0
@@ -121,9 +125,13 @@ class CameraStream:
         self._subs = []
         self._sync = None
 
+        color_msg_type = CompressedImage if cfg.color_compressed else Image
+        depth_msg_type = CompressedImage if cfg.depth_compressed else Image
+
+
         if cfg.depth_image_topic:
-            color_sub = message_filters.Subscriber(node, Image, cfg.color_image_topic)
-            depth_sub = message_filters.Subscriber(node, Image, cfg.depth_image_topic)
+            color_sub = message_filters.Subscriber(node, color_msg_type, cfg.color_image_topic)
+            depth_sub = message_filters.Subscriber(node, depth_msg_type, cfg.depth_image_topic)
             self._subs.extend([color_sub, depth_sub])
             if cfg.frames_approx_sync:
                 self._sync = message_filters.ApproximateTimeSynchronizer(
@@ -134,7 +142,7 @@ class CameraStream:
             self._sync.registerCallback(self._frames_callback)
         else:
             self._subs.append(
-                node.create_subscription(Image, cfg.color_image_topic, self._color_only_callback, 10)
+                node.create_subscription(color_msg_type, cfg.color_image_topic, self._color_only_callback, 10)
             )
 
         if cfg.camera_info_topic:
@@ -143,7 +151,26 @@ class CameraStream:
             )
 
     @staticmethod
-    def _stamp_to_dict(msg: Image) -> dict:
+    def _msg_encoding(msg: Image | CompressedImage) -> str:
+        if isinstance(msg, Image):
+            return str(msg.encoding)
+
+        if isinstance(msg, CompressedImage):
+            fmt = str(msg.format)
+            if ";" in fmt:
+                return fmt.split(";", 1)[0].strip()
+            return fmt
+
+        return ""
+    
+    @staticmethod
+    def _compressed_format(msg: Image | CompressedImage) -> str:
+        if isinstance(msg, CompressedImage):
+            return str(msg.format)
+        return ""
+    
+    @staticmethod
+    def _stamp_to_dict(msg: Image | CompressedImage) -> dict:
         sec = int(msg.header.stamp.sec)
         nanosec = int(msg.header.stamp.nanosec)
         return {
@@ -166,12 +193,24 @@ class CameraStream:
         with self.lock:
             self.camera_info = info
 
-    def _color_msg_to_bgr(self, msg: Image) -> np.ndarray:
-        image = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+    def _color_msg_to_bgr(self, msg: Image | CompressedImage) -> np.ndarray:
+        if self.cfg.color_compressed:
+            image = self.bridge.compressed_imgmsg_to_cv2(msg, desired_encoding="bgr8")
+        else:
+            image = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
         return np.ascontiguousarray(image)
 
-    def _depth_msg_to_meters(self, msg: Image) -> Tuple[np.ndarray, np.ndarray]:
-        raw = self.bridge.imgmsg_to_cv2(msg, desired_encoding="passthrough")
+    def _depth_msg_to_meters(self, msg: Image | CompressedImage) -> Tuple[np.ndarray, np.ndarray]:
+        if self.cfg.depth_compressed:
+            if isinstance(msg, CompressedImage) and "compressedDepth" in msg.format:
+                raise RuntimeError(
+                    "compressedDepth depth topics are not supported yet. "
+                    "Use the raw depth topic or implement compressedDepth decoding."
+                )
+            raw = self.bridge.compressed_imgmsg_to_cv2(msg, desired_encoding="passthrough")
+        else:
+            raw = self.bridge.imgmsg_to_cv2(msg, desired_encoding="passthrough")
+
         if raw.ndim == 3:
             raw = raw[:, :, 0]
         raw = np.ascontiguousarray(raw)
@@ -180,7 +219,7 @@ class CameraStream:
             depth_m = depth_m * 0.001
         return raw, np.ascontiguousarray(depth_m)
 
-    def _frames_callback(self, color_msg: Image, depth_msg: Image) -> None:
+    def _frames_callback(self, color_msg: Image | CompressedImage, depth_msg: Image | CompressedImage) -> None:
         try:
             color_bgr = self._color_msg_to_bgr(color_msg)
             depth_raw, depth_m = self._depth_msg_to_meters(depth_msg)
@@ -192,8 +231,10 @@ class CameraStream:
                 self.depth_stamp = self._stamp_to_dict(depth_msg)
                 self.color_frame_id = str(color_msg.header.frame_id)
                 self.depth_frame_id = str(depth_msg.header.frame_id)
-                self.color_encoding = color_msg.encoding
-                self.depth_encoding = depth_msg.encoding
+                self.color_encoding = self._msg_encoding(color_msg)
+                self.depth_encoding = self._msg_encoding(depth_msg)
+                self.color_compressed_format = self._compressed_format(color_msg)
+                self.depth_compressed_format = self._compressed_format(depth_msg)
                 self.frames_received += 1
                 self.last_frame_wall_time = time.time()
                 self.last_error = "OK"
@@ -202,14 +243,15 @@ class CameraStream:
                 self.last_error = f"Frame conversion error: {exc}"
             self.node.get_logger().warning(f"[{self.cfg.name}] {self.last_error}")
 
-    def _color_only_callback(self, color_msg: Image) -> None:
+    def _color_only_callback(self, color_msg: Image | CompressedImage) -> None:
         try:
             color_bgr = self._color_msg_to_bgr(color_msg)
             with self.lock:
                 self.color_bgr = color_bgr
                 self.color_stamp = self._stamp_to_dict(color_msg)
                 self.color_frame_id = str(color_msg.header.frame_id)
-                self.color_encoding = color_msg.encoding
+                self.color_encoding = self._msg_encoding(color_msg)
+                self.color_compressed_format = self._compressed_format(color_msg)
                 self.frames_received += 1
                 self.last_frame_wall_time = time.time()
                 self.last_error = "OK"
@@ -230,6 +272,8 @@ class CameraStream:
                 camera_info=None if self.camera_info is None else dict(self.camera_info),
                 color_encoding=self.color_encoding,
                 depth_encoding=self.depth_encoding,
+                color_compressed_format=self.color_compressed_format,
+                depth_compressed_format=self.depth_compressed_format,
             )
 
     def status_text(self) -> str:
@@ -286,7 +330,9 @@ class SaveFramesGuiNode(Node):
                 self, cfg, queue_size=self.sync_queue_size, slop_sec=self.sync_slop_sec
             )
             self.get_logger().info(
-                f"Camera '{cfg.name}': color='{cfg.color_image_topic}', depth='{cfg.depth_image_topic}', "
+                f"Camera '{cfg.name}': "
+                f"color='{cfg.color_image_topic}' compressed={cfg.color_compressed}, "
+                f"depth='{cfg.depth_image_topic}' compressed={cfg.depth_compressed}, "
                 f"approx_sync={cfg.frames_approx_sync}"
             )
 
@@ -460,11 +506,15 @@ class SaveFramesGuiNode(Node):
             "depth_frame_id": snapshot.depth_frame_id,
             "color_encoding": snapshot.color_encoding,
             "depth_encoding": snapshot.depth_encoding or cfg.depth_frame_encoding,
+            "color_compressed_format": snapshot.color_compressed_format,
+            "depth_compressed_format": snapshot.depth_compressed_format,
             "depth_unit_saved": "meters_float32_for_npy_tiff32_exr; millimeters_uint16_for_png16",
             "topics": {
                 "color_image_topic": cfg.color_image_topic,
                 "depth_image_topic": cfg.depth_image_topic,
                 "camera_info_topic": cfg.camera_info_topic,
+                "color_compressed": cfg.color_compressed,
+                "depth_compressed": cfg.depth_compressed,
             },
             "camera_info": snapshot.camera_info,
             "files": saved_files + [meta_rel],
@@ -496,6 +546,8 @@ class SaveFramesGuiNode(Node):
             color_image_topic=str(data.get("color_image_topic", "")),
             depth_image_topic=str(data.get("depth_image_topic", "")),
             camera_info_topic=str(data.get("camera_info_topic", "")),
+            color_compressed=bool(data.get("color_compressed", False)),
+            depth_compressed=bool(data.get("depth_compressed", False)),
             frames_approx_sync=bool(data.get("frames_approx_sync", True)),
             depth_frame_encoding=str(data.get("depth_frame_encoding", "32FC1")),
             depth_unit_in_meters=bool(data.get("depth_unit_in_meters", True)),
