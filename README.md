@@ -1,6 +1,8 @@
-<# save_frames_gui
+# Save Frames Gui
 
-ROS 2 Python package for real-time RGB/depth preview and manual frame capture from multiple cameras in parallel.
+ROS 2 Python package for real-time RGB/depth preview and manual or trigger-service-based frame capture from multiple cameras in parallel.
+
+<img src="docs/img/gui.png" alt="Save Frames GUI preview" height="500">
 
 ## Features
 
